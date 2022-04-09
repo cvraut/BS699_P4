@@ -1,0 +1,561 @@
+---
+title: "Project Four Example"
+author: "Jean Morrison"
+date: "3/24/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document contains some code and discussion of analyzing one simulated data set (the inside loop of a simulation study). 
+
+Echoing the theme of the "Simulations" lecture, an outline of your analysis might look like:
+
+```
+for p in interesting_parameters{
+  for j in 1:nsims{
+    D <- simulate_data(p)
+    result <- analyze_data(D)
+    eval <- evaluate(result, D)
+    store eval, maybe result, and parameters(p)
+  }
+}
+
+summarize results
+```
+
+In this document, I will walk through some choices you could make for the inside steps "simulate data" "analyze data" and "evaluate". 
+
+## Simulate
+
+The first step is to simulate some data that "look like" real RNA-seq data. In class we talked about two options. A parametric simulation strategy using the negative binomial distribution and a non-parametric simulation strategy using binomial thinning. 
+
+A node on library size: In this document, I will use library size as a shorthand for the column sums of the count matrix. Previously, we have used "library size" to mean the total number of sequenced fragments which is larger than the column sums of the count matrix. 
+
+### Non-Parametric Simulation
+
+First, let's generate one data set using the non-parametric "binomial thinning" strategy. We need to choose some parameters. In your project, you will consider how varying these changes results. 
+
++ 20 samples, 10 in each group. 
++ 5% of genes are differentially expressed. 
++ Among differentially expressed genes, the distribution of log 2 fold change is $N(0, 0.8^2)$.
++ Average library size is about half of the average library size of the reference data. 
+
+#### Installation Notes for `seqgendiff`
+
+The `seqgendiff` R package requires the package [sva](https://www.bioconductor.org/packages/release/bioc/html/sva.html) which is a Bioconductor package. Install using 
+
+```{r, eval = FALSE}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("sva")
+```
+
+In my experience, Bioconductor packages take longer to install and have more dependencies than your average CRAN package. If you have installation trouble, let me know and I will try to help. 
+
+After installing `sva` you should be able to install `seqgendiff` with
+
+```{r, eval =FALSE}
+install.packages("seqgendiff")
+```
+
+#### Simulation
+
+The first steps are to sample some columns (observations) from the reference data and then down-sample to achieve the desired expected library size.
+
+```{r}
+library(seqgendiff)
+# Read in reference data
+X_ref <- readRDS("kidney_expression.RDS")
+# Remove rows (genes) that are completely zero
+ix <- which(rowSums(X_ref) ==0)
+X_ref <- X_ref[-ix,]
+
+set.seed(10) #Always a good idea!
+n <- 20
+
+# Sample 20 observations
+ix <- sample(ncol(X_ref), size = n, replace = TRUE)
+X_samp <- X_ref[,ix]
+
+# Down-sample for library size adjustment
+p = 0.5 # Want to reduce library size by half
+X_samp_thin <- thin_lib(X_samp, thinlog2 = rep(log(1/p, base = 2), n))
+```
+
+Let's do a quick check that the thinning function worked. 
+
+```{r}
+# Check that results are as expected
+plot(colSums(X_samp)/1e6, colSums(X_samp_thin$mat)/1e6, xlab = "Reference Library Size", ylab = "Down-Sampled Library Size")
+abline(0, p)
+```
+
+Next, we add signal
+```{r}
+# Add Signal
+X_np <- thin_2group(mat = X_samp_thin$mat,
+                                  prop_null = 0.95,
+                                  signal_fun = rnorm,
+                                  signal_params = list(mean =0, sd = 0.8),
+                                  group_prop = 0.5)
+table(X_np$designmat)
+```
+
+Let's confirm that the simulated effect sizes have the distribution we expect them to. `X_np$coefmat` is a one column matrix. Each element is the true (expected) log2 fold change comparing group 1 to group 0.
+```{r}
+# Check the number of null genes (non-DEGs)
+mean(X_np$coefmat == 0)
+# Check the distribution of effect sizes for DEGs
+hist(X_np$coefmat[X_np$coefmat !=0], freq = FALSE, main = "Simulated log2 fold change for DEGs", 
+     xlab = "log2 fold change")
+curve(dnorm(x, sd = 0.8), add = TRUE)
+```
+
+
+If you use  this strategy in your project, you might want to collect these steps into a function. 
+
+### Parametric Simulation
+
+Next we simulate one data set using the parametric strategy. We will use the same parameters that we used in the non-parametric simulation. 
+
++ 20 samples, 10 in each group. 
++ 5% of genes are differentially expressed. 
++ Among differentially expressed genes, the distribution of log 2 fold change is $N(0, 0.8^2)$.
++ Average library size is about half of the average library size of the reference data. 
+
+#### Installation Notes
+
+This section uses the [PROPER R package](https://www.bioconductor.org/packages/release/bioc/html/PROPER.html), which is a Bioconductor package.
+
+```{r, eval = FALSE}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("PROPER")
+```
+
+#### Simulation
+
+Note that `simRNAseq` always generates a warning. This is not something to be worried about and is a feature of some slightly lazy type-checking in the PROPER package code.
+
+The first step is to use PROPER to estimate parameters for the mean and over-dispersion of the negative binomial distribution. 
+
+```{r}
+library(PROPER)
+#Estimate Parameters
+params <- estParam(X_ref, type = 1)
+names(params)
+#[1] "seqDepth" "lmeans"   "lOD"
+```
+
+Next we need to generate some data. 
+The `lBaselineExpr` parameter controls the log expected number of counts for each gene. If we just pass in `params$lmeans` we will get data with the same average library size as the reference data. To reduce the average library size by a factor of `p` we need to use `params$lmeans + log(p)`. 
+
+Note that for PROPER, the seed is passed in the simulation options object. This means that if we wanted to generate a second data set, we would need to change the seed in the parameters object. 
+
+The `lfc` option should be a function for generating natural log fold change. Since we have a distribution for log2 fold change, we need to convert to natural log. 
+
+```{r}
+#simulation options
+p <- 0.5
+so <- RNAseq.SimOptions.2grp(ngenes = nrow(X_ref),
+                             lBaselineExpr = params$lmeans + log(p),
+                             lOD = params$lOD,
+                             p.DE = 0.05,
+                             lfc = function(n){rnorm(n, mean = 0, sd = 0.8/log(exp(1), base = 2))},
+                             sim.seed = 1 # <--- Seed is here
+                             )
+# so,i;ate
+X_p <- simRNAseq(simOptions = so, n1 = 10, n2 = 10)
+```
+
+The true log fold changes from the `PROPER` object are stored in two places `X_p$DEid` contains the indexes of the differentially expressed genes. `X_p$simOptions$lfc` contains the natural log fold change for these genes. For, I will create a single vector and convert these effect to log base 2. The other quirk about `PROPER` is that the log fold changes it reports are $$log\left(\frac{E[X_{i,j} \vert D_i = 0]}{E[X_{i,j} \vert D_i = 1]}\right)$$
+i.e. the 0 group is in the numerator. This is the opposite of the `seqgendiff` package. Later, we will estimate the negative of this value (i.e. the 1 group in the numerator), so I also flip the sign of the effect.
+
+```{r}
+X_p$truth <- rep(0, nrow(X_p$counts))
+X_p$truth[X_p$DEid] <- -X_p$simOptions$lfc/log(2)
+```
+
+
+Now we have two data sets. I will call the data set generated using `seqgendiff` data set NP (for non-parametric) and the data set generated using `PROPER` data set P (for parametric). 
+
+
+## Analysis
+
+Now we need a way to analyze the data. We want a function that takes in a matrix of counts and a design matrix (group labels) and outputs estimates of the log2 fold change (l2fc) and a p-value for each gene.
+
+To start, I will use the t-test strategy that we discussed in class. Let $X_{i,j}$ be observed counts for individual $i$ at gene $j$. Let $d_i$ be the group status of individual $i$ -- $d_i$ is 1 if individual $i$ was a responder and 0 otherwise. Let $L_i$ be the library size (column sums) for individual $i$. The t-test strategy fits the model 
+
+$$log_2\left(\frac{X_{ij} + 0.5}{L_i} \right) = \beta_0 + \beta_1 d_i + \epsilon_{i,j}$$
+$$\epsilon_{i,j} \sim N(0, \sigma^2_j)$$
+
+
+This is not a perfect model for the observed data. We don't necessarily think that log2 counts are normally distributed conditional on group membership. We talked about the idea that negative binomial might be a better model. You may see consequences of this simplification in your results. This is part of the motivation for Q4 which asks you to assess the actual false discovery rate we expect using this strategy. In general, if you think that some of the assumptions of your method my not hold in the real data, it is a good idea to try to assess what affect that will have on your results.
+
+Adding 0.5 to the count matrix helps us avoid infinite values after taking the log. The choice of 0.5 is a bit arbitrary, though it is not uncommon to use half the minimum value for values "below the threshold of detection". 
+
+(Aside) Filling in half the minimum value for values below a detection threshold ("left censored values") is not an ideal solution, but is almost always the approach taken for bulk RNA-seq data. The argument in favor of the approach here is that 0's are rare in genes with moderate or high expression, so any gains from doing something "better" would be small. However, in other contexts, this choice can matter. In those cases, it can be better to model the distribution of the left censored values. See [here](https://pubmed.ncbi.nlm.nih.gov/17478436/) for an example. This problem also connects to the multiple vs. single imputation ideas that we have been talking about. Filling in a value for the left-censored observations is single imputation. Modeling the distribution of the left censored values, like multiple imputation, takes into accout uncertainty we have about the true value we would have observed with a more accurate measurement. We also ran into this problem in Project 2 (tumor size recorded as 0).
+
+
+At the end of this document, I will include some alternate analysis strategies that you can use in your report if you want to. There is also a (much) faster version of this function at the end. 
+
+```{r}
+run_t_test <- function(Y, D){
+  # Minimal argument checking
+  stopifnot(is.matrix(Y))
+  stopifnot(is.vector(D))
+  stopifnot(length(D) == ncol(Y))
+  
+  L <- colSums(Y) # Column sums is proportional to the total library size
+  # convert X to log2 CPM
+  Y <- t(t(log2(Y + 0.5)) - log2(L))
+  # I have used a trick to get R to do column-wise subtraction. 
+  # By default, R applies a vector operation row-wise so I transposed the matrix, 
+  # subtracted, and then transposed back.
+  
+  # Perform t-test
+  res <-  sapply(1:nrow(Y), function(i) {
+    # Use try to capture errors that occur when all samples have 0 counts
+    t <- try(t.test(Y[i,] ~ D), silent = TRUE) 
+    if(class(t) == "try-error") {
+      return(c(NA, NA))
+    } else {
+      c(t$estimate[2]-t$estimate[1],t$p.value) }})
+  res <- data.frame(t(res))
+  names(res) <- c("l2fc", "p")
+  return(res)
+}
+```
+
+
+## Evaluate
+
+Now we want to see how the t-test method performs in our two data sets. For illustrative purposes, I will do some detailed exploration of our results and then talk about what kind of measurements you might want to record in your simulations.
+
+The first step is to apply the analysis function to the simulated data. 
+
+```{r, warning= FALSE, message = FALSE}
+library(ggplot2)
+library(dplyr)
+```
+
+```{r, cache = TRUE}
+np_results <- run_t_test(Y = X_np$mat, D = as.vector(X_np$designmat))
+np_results$truth <- X_np$coefmat[,1]
+np_results$obs_mean_count <- rowMeans(X_np$mat)
+
+p_results <- run_t_test(Y= X_p$counts, D = X_p$designs)
+p_results$truth <- X_p$truth
+p_results$obs_mean_count <- rowMeans(X_p$counts)
+```
+
+Let's look at how the estimated log 2 fold changes correspond to the true log 2 fold changes. To do this, I will split the genes into those that are true DEGs (effect size not equal to 0) and null genes (effects equal to zero). 
+I will also limit to genes that have an observed average number of counts greater than 5. 
+
+```{r}
+np_deg <- np_results %>% 
+  filter(obs_mean_count > 5 & truth != 0) %>%
+    ggplot() + 
+  geom_point(aes(x=truth, y = l2fc, col =  log10(obs_mean_count))) + 
+  geom_abline(slope = 1, col = "red", lwd = 1) + 
+  scale_color_continuous(name = "Avg Count") + 
+  ggtitle("Data Set NP: DEGs") + 
+  ylab("Estimated log2 FC") + xlab("True log2 FC")+ 
+  theme_bw()
+```
+
+
+```{r, cache = TRUE}
+p_deg <- p_results %>% 
+  filter(obs_mean_count > 5  & truth != 0) %>%
+  ggplot() + 
+  geom_point(aes(x=truth, y = l2fc, col =  log10(obs_mean_count))) + 
+  scale_color_continuous(name = "Avg Count") + 
+  geom_abline(slope = 1, lwd = 1, col ="red") + 
+  ggtitle("Data Set P: DEGs") + 
+  ylab("Estimated log2 FC") + xlab("True log2 FC")+ 
+  theme_bw()
+```
+
+
+```{r, message=FALSE}
+library(gridExtra)
+grid.arrange(np_deg, p_deg, ncol= 2)
+```
+From these plots, we can observe that, in data set P, the estimates from the t-test method appear to be centered around the truth while in data set NP, they are offset. It looks like there is some systemic bias in the estimates made in the the estimates made using data set NP. We can check and find out that `r round(mean(np_results$l2fc > np_results$truth)*100)`% of estimates in are larger than the truth in data set NP while `r round(mean(p_results$l2fc > p_results$truth)*100)`% of estimates  are larger than the truth in data set P. 
+
+These plots help us make observations about the methods but don't answer questions about power. For this we need to identify which genes are "discovered" and which genes are not discovered. This means we need a method for identifying differentially expressed genes based on the output of the analysis method. Since we are doing several thousand tests, we need to take this into account. 
+ We will have some lecture on this in class soon. Here, I will use the Benjamini-Hochberg false discovery rate estimate. This method computes an estimate of the false discovery rate for p-value thresholds corresponding to each p-value produced by the analysis. 
+
+```{r}
+np_results$fdr_est <- p.adjust(np_results$p, method = "BH")
+p_results$fdr_est <- p.adjust(p_results$p, method = "BH")
+
+sum(np_results$fdr_est < 0.05)
+sum(np_results$fdr_est < 0.1)
+
+sum(p_results$fdr_est < 0.05)
+sum(p_results$fdr_est < 0.1)
+```
+
+At an estimated false discovery rate threshold of 5%, we discover `r sum(p_results$fdr_est < 0.05)` genes in data set P and `r sum(np_results$fdr_est < 0.05)` in data set NP. 
+
+We can also check how many of these discovered genes are true differentially expressed genes, and what the observed false discovery rate is at each threshold. 
+```{r}
+sum(np_results$fdr_est < 0.05 & np_results$truth != 0 )
+# Observed false discovery rate at 5% in data set NP
+sum(np_results$fdr_est < 0.05 & np_results$truth == 0 )/ sum(np_results$fdr_est < 0.05 )
+sum(np_results$fdr_est < 0.1 & np_results$truth != 0)
+# Observed false discovery rate at 10% in data set NP
+sum(np_results$fdr_est < 0.1 & np_results$truth == 0 )/ sum(np_results$fdr_est < 0.1 )
+```
+
+```{r}
+sum(p_results$fdr_est < 0.05 & p_results$truth != 0 )
+# Observed false discovery rate at 5% data set P
+sum(p_results$fdr_est < 0.05 & p_results$truth == 0 )/ sum(p_results$fdr_est < 0.05 )
+sum(p_results$fdr_est < 0.1 & p_results$truth != 0)
+# Observed false discovery rate at 10% in data set P
+sum(p_results$fdr_est < 0.1 & p_results$truth == 0 )/ sum(p_results$fdr_est < 0.1 )
+```
+
+In both cases, our observed false discovery rate is lower than the target false discovery rate. It could be that our estimates of the FDR are conservative, though we can't say this difinitvely from only one data set. 
+
+The BH correction will only difinitively yield the correct FDR on average if the p-values are well calibrated, meaning that they are uniformly distributed under the null.  We can look at this in the simulated data by comparing the distribution of p-values for null genes to a uniform distribution in a Q-Q plot.
+
+
+```{r}
+filter(np_results, truth == 0)  %>% ggplot() +  
+  stat_qq(aes(sample = p), distribution = stats::qunif) + 
+  geom_abline(slope = 1, lty = 2) + 
+  ggtitle("q-q plot for null p-values in data set NP")
+```
+
+```{r}
+filter(p_results, truth == 0)  %>% ggplot() +  
+  stat_qq(aes(sample = p), distribution = stats::qunif) + 
+  geom_abline(slope = 1, lty = 2) + 
+  ggtitle("q-q plot for null p-values in data set P")
+```
+
+
+In the parametric data set, the null p-values are approximately uniformly distributed. In the non-parametric data set, the null p-values are a little skewed towards 0.
+
+
+
+## Important Disclaimer
+
+This example has included analysis of only one data set. For your project. You will need to simulate many data sets so that you can characterize average (expected) behavior. The observations I made about false discovery rates, number of discovered genes, and p-value distributions may or may not be representative of the expected behavior. 
+
+
+## Alternative Analysis Strategies
+
+In results of the preceding sections, it seemed like the t-test method was doing ok in data set P, even though the error distribution is wrong -- the observations are from a negative binomial distribution while we are modeling them as log-normal. 
+
+However, the t-test method was not doing as well in data set NP. These data likely have a different distribution than the parametric data. They also have correlation between genes while the parametric data do not. This correlation is probably the culprit for the systematic bias we observed. 
+
+One model for correlation among genes is that there are unobserved individual level factors $Z_{1,i}, \dots Z_{k,i}$ that affect expression of multiple genes. Bias in the effect estimate arises from accidental correlation between the unobserved factors and the group variable. On average (across many data sets) the bias will be zero because the group assignment is random. Within any single data set, the bias will be non-zero *and* the bias will be in a similar direction across genes. This explains the shift we saw between the estimated and true effect sizes.
+
+Below is an extension of the t-test model to a linear regression model. I have made two modifications. First, rather than having a ratio on the left, I have moved library size to the right and added a coefficient. In the t-test model, this coefficient is fixed at 1, while in the new model we estimate the coefficient. Second, I have added the matrix $Z$, though as yet we don't know what $Z$ is or how many columns it has (i.e. what $k$ is).
+
+
+$$log_2(X_{i,j}  + 0.5) = \beta_0 + \beta_1 D_{i} + \beta_{L}\log_2(L_i) + \eta Z  + \epsilon_{i,j}$$
+$$\epsilon_{i,j} \sim N(0, \sigma^2)$$
+Below is a function that fits this model. I've used some linear algebra to speed it up relative to using `lm`. I also added options for sandwich standard error estimates which we will look at later. Running this function with `fixL_coef = TRUE` will generate the same results as the t-test function (but much faster).
+
+```{r}
+run_lm <- function(Y, D, Z = NULL, sandwich = FALSE, fixL_coef = FALSE){
+  # Minimal argument checking
+  stopifnot(is.matrix(Y))
+  stopifnot(is.vector(D))
+  stopifnot(length(D) == ncol(Y))
+  
+  L <- colSums(Y) 
+  Y <- log2(Y + 0.5)
+  n <- ncol(Y)
+  
+  # Set up the model matrix
+  if(!fixL_coef){
+    X <- cbind(rep(1, n), D, log2(L))
+  }else{
+    Y <- t(t(Y) - log2(L))
+    X <- cbind(rep(1, n), D)
+  }
+  if(!is.null(Z)) X <- cbind(X, Z)
+  
+  # Compute the regression coefficients
+  #XtXinv <- solve(t(X)%*%X)
+  XtXinv <- solve(crossprod(X))
+  #Px <- XtXinv%*%t(X)
+  Px <- tcrossprod(XtXinv, X)
+  #bhat <- Px%*%t(Y)
+  bhat <- tcrossprod(Px, Y)
+  #Ytilde <- t(bhat) %*% t(X)
+  Ytilde <- tcrossprod(t(bhat), X)
+  p <- ncol(X)
+  l2fc <- bhat[2,]
+  
+  # Compute standard errors
+  if(!sandwich){
+    s2 <- rowSums((Y-Ytilde)^2)/(n-p)
+    s <- sqrt(s2*XtXinv[2,2])
+  }else{
+    H <- X %*% Px
+    Yresid2 <- (Y - Ytilde)^2
+    omega <- t(t(Yresid2)/((1-diag(H))^2))
+    s <- sapply(seq(nrow(Y)), function(i){
+      O <- diag(omega[i,])
+      V <- tcrossprod(crossprod(t(Px), O), Px)
+      return(sqrt(V[2,2]))
+    })
+  }
+  # Compute p-values
+  p <- 2*pt(-abs(l2fc/s), df = n - p)
+  res <- data.frame(l2fc=l2fc, se = s, p = p)
+  return(res)
+}
+```
+
+Now we need to estimate the $Z$ variables. A simple, common choice is to use the first few principal components. A related method is called SVA. SVA was developed for removing artifacts from microarray experiments (RNA-seq is a microarray experiment). SVA attempts to compute components that don't accidentally include some of the signal. 
+
+
+Below, I try both approaches. I used 5 PCs because the SVA algorithm suggested using 5 SVA components.
+
+```{r, message = FALSE, warning=FALSE}
+library(sva)
+```
+
+```{r, cache = TRUE}
+pcs_np <- princomp(X_np$mat)
+
+
+X <- cbind(X_np$design_obs, X_np$designmat, 
+           log2(colSums(X_np$mat)))
+Y <- log2(X_np$mat + 0.5)
+
+sva_np <- sva(log2(X_np$mat + 0.5), mod =X, mod0 = X[,-2])
+
+# PCA correction
+f1 <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], 
+             Z = pcs_np$loadings[, 1:5])
+
+# SVA correction
+f2 <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], 
+             Z = sva_np$sv)
+
+# No correction
+f0 <- run_lm(Y = X_np$mat, D = X_np$designmat[,1])
+
+res <- data.frame(b_pcs = f1$l2fc, b_sva = f2$l2fc, b_none = f0$l2fc,
+                  truth = X_np$coefmat[,1], 
+                  obs_mean_count = rowMeans(X_np$mat))
+
+res %>% filter(obs_mean_count > 5 & truth != 0) %>%
+    ggplot() + 
+geom_point(aes(x=truth, y = b_pcs, col =  log10(obs_mean_count))) + 
+  geom_abline(slope = 1, col = "red", lwd = 1.2) + 
+  ggtitle("PC adjusted lm applied to non-parametric simulation: DEGs")
+
+res %>% filter(obs_mean_count > 5 & truth !=0) %>%
+    ggplot() + 
+geom_point(aes(x=truth, y = b_sva, col =  log10(obs_mean_count))) + 
+  geom_abline(slope = 1, col = "red", lwd = 1.2) + 
+  ggtitle("SVA adjusted lm applied to non-parametric simulation: DEGs")
+
+```
+
+
+In our simulated data, the PCA and SVA approaches both correct most of the bias that we saw previously. 
+Using the method with no confounder correction, the average bias is `r round( with(res, mean(b_none-truth)), digits = 3)`, reflecting the upward shift we saw in the scatter plot. With the PC correction, the average bias is `r round( with(res, mean(b_pcs-truth)), digits = 3)` and with the SVA correction, the average bias is `r round( with(res, mean(b_sva-truth)), digits = 3)`. In this case, the bias is actually higher using the PC correction and is much lower using the SVA correction. 
+
+
+We can also compare how these methods perform in terms of discovering DEGs. The PCA method discovers fewer genes and the SVA method discovers more genes than the original strategy.
+
+```{r}
+library(tidyr)
+fdr_res <- data.frame(pcs = p.adjust(f1$p, method = "BH"), 
+                      sva = p.adjust(f2$p, method = "BH"), 
+                      none = p.adjust(f0$p, method = "BH"), 
+                      truth = X_np$coefmat[,1])
+
+fdr_res <- fdr_res %>% pivot_longer(cols = c(pcs, sva, none), 
+                                    names_to = "method", values_to = "fdr_est")
+
+fdr_res %>% group_by(method) %>% summarise(n_disc_5 = sum(fdr_est < 0.05), 
+                                           n_disc_10 = sum(fdr_est < 0.1), 
+                                           fdr_obs_5 = sum(fdr_est < 0.05 & truth ==0)/n_disc_5, 
+                                           fdr_obs_10 = sum(fdr_est < 0.1 & truth == 0)/n_disc_10)
+```
+
+
+However, the SVA method has higher than expected FDR. Note -- this doesn't necessarily mean that the tests are miscalibrated. The Benjamini-Hochberg FDR correction only guarantees us *average* FDR control. To know if there was a problem or not, we would need to perform more simulations. We would also need to do more simulations to know if this pattern held up or was an accident of our data. 
+
+Another way that we know our model is over-simplified compared to the real data is in the error distribution. We know our data are not  normal and homoskedastic. An easy adjustment is to use robust sandwich variance estimates. I added this as an option in the function above, so it is easy to re-run our analysis with the sandwich variance estimates. 
+
+```{r}
+
+f1s <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], 
+             Z = pcs_np$loadings[, 1:4], sandwich=TRUE)
+
+f2s <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], 
+             Z = sva_np$sv, sandwich=TRUE)
+
+f0s <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], sandwich = TRUE)
+
+fdr_res_sandwich <- data.frame(pcs = p.adjust(f1s$p, method = "BH"), 
+                      sva = p.adjust(f2s$p, method = "BH"), 
+                      none = p.adjust(f0s$p, method = "BH"), 
+                      truth = X_np$coefmat[,1])
+
+fdr_res_sandwich <- fdr_res_sandwich %>% pivot_longer(cols = c(pcs, sva, none), 
+                                    names_to = "method", values_to = "fdr_est")
+
+fdr_res_sandwich %>% group_by(method) %>% summarise(n_disc_5 = sum(fdr_est < 0.05), 
+                                           n_disc_10 = sum(fdr_est < 0.1), 
+                                           fdr_obs_5 = sum(fdr_est < 0.05 & truth ==0)/n_disc_5, 
+                                           fdr_obs_10 = sum(fdr_est < 0.1 & truth == 0)/n_disc_10)
+
+```
+
+We find that using the sandwich estimates brings the observed FDR for this simulation below the nominal level, though it reduces the number of discoveries by quite a bit. 
+
+We can also compare p-value distributions for null genes with and without the sandwich standard errors. 
+
+
+```{r}
+f2$truth <- f2s$truth <- X_np$coefmat[,1]
+filter(f2, truth == 0)  %>% ggplot() +  
+     stat_qq(aes(sample = p), distribution = stats::qunif) + 
+     geom_abline(slope = 1, lty = 2) + ggtitle("Q-Q plot for null gene p-values using non-robust SEs")
+
+filter(f2s, truth == 0)  %>% ggplot() +  
+     stat_qq(aes(sample = p), distribution = stats::qunif) + 
+     geom_abline(slope = 1, lty = 2) + ggtitle("Q-Q plot for null gene p-values using robust SEs")
+```
+
+These q-q plots suggest that the sandwich SEs are a bit conservative -- the p-values are skewed towards 0. 
+
+### Speed
+The `run_lm` function should prduce the same results as the `run_t_test` function with the option `fixL_coef=TRUE`. 
+
+```{r}
+system.time(res1 <- run_lm(Y = X_np$mat, D = X_np$designmat[,1], fixL_coef = TRUE))
+
+system.time(res2 <- run_t_test(Y = X_np$mat, D = X_np$designmat[,1]))
+all.equal(res1$l2fc, res2$l2fc)
+```
+
+On my computer, `run_lm` is about 200 times faster than `run_t_test`.
+
+## More Strategies
+
+There are more "bespoke" RNA-seq analysis strategies that are beyond the scope of this class. Most of these try to more explicitly measure the mean-variance relationship. Popular programs include edgeR, DESeq2, and limma-voom. In my experience, both edgeR and DESeq2 can be anti-conservative (inflated false discovery rate) in some circumstances. If you are interested in applying one of these and want help, feel free to talk to me about it.
+
+
