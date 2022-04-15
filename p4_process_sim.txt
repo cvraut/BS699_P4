@@ -1,0 +1,52 @@
+#!/bin/sh
+#SBATCH --job-name=p4_process_sim   # Job name
+#SBATCH --mail-type=ALL         # Mail events (NONE, BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=craut+bsc@umich.edu # Where to send mail	
+#SBATCH --nodes=1                   # Use one node
+#SBATCH --ntasks=1                  # Run a single task
+#SBATCH --mem-per-cpu=1gb           # Memory per processor
+#SBATCH --time=03:00:00             # Time limit hrs:min:sec
+#SBATCH --output=array_%A-%a.out    # Standard output and error log
+#SBATCH --array=1-8               # Array range
+# This is an example script that combines array tasks with
+# bash loops to process many short runs. Array jobs are convenient
+# for running lots of tasks, but if each task is short, they 
+# quickly become inefficient, taking more time to schedule than
+# they spend doing any work and bogging down the scheduler for
+# all users. 
+
+pwd; hostname; date
+
+# Set the number of runs that each SLURM task should do
+# This is equivalent to how many seeds I should go through for each exp setting
+PER_TASK=10000
+
+# get to my profile
+source ~/.bash_profile
+# get to the place of action
+ACTION=~/Coursework/W2022/BS699/BS699_P4
+cd $ACTION
+
+# Print the task and run range
+read -r N_NON_RESP N_RESP  <<< "$(sed -n $SLURM_ARRAY_TASK_ID'p' $ACTION/params.txt)"
+N_OBS=$(($N_NON_RESP + $N_RESP))
+
+# who is this, what is this doing
+echo This is task $SLURM_ARRAY_TASK_ID, which will do $PER_TASK sims
+
+# Run the loop of runs for this task.
+START_NUM=$(( ($SLURM_ARRAY_TASK_ID - 1) * $PER_TASK + 1 ))
+END_NUM=$(( $SLURM_ARRAY_TASK_ID * $PER_TASK ))
+
+UPP_BND=$(sed -n '$=' ./rda_locs.txt)
+
+for (( run=$START_NUM; run<=END_NUM && run<=UPP_BND; run++ )); do
+  echo This is SLURM task $SLURM_ARRAY_TASK_ID, run number $run
+  read -r FILE  <<< "$(sed -n $run'p' $ACTION/rda_locs.txt)"
+  echo using rda file: $FILE
+  outdir=$ACTION/slurm/out/arr_$SLURM_ARRAY_TASK_ID/task_$run/
+  mkdir -p $outdir
+  Rscript --slave $ACTION/process_sim.R --file $FILE > $outdir$run.out 2> $outdir$run.err
+done
+
+date
